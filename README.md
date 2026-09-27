@@ -12,7 +12,7 @@ A ROS 2 / Python implementation of the **Robot Conga** leader-follower sequentia
 
 In multi-agent robotic systems (such as warehouse AGVs, industrial pipeline inspection units, hospital disinfection teams, and exploratory rovers), multiple robots frequently need to traverse constrained corridors, aisles, or shared pathways in an orderly, single-file fashion.
 
-Traditional formation control strategies generally enforce rigid geometric shapes (triangles, lines abreast) or rely on time-parameterized trajectories ($t \mapsto \mathbf{x}(t)$) and time-delay following ($t - \tau$). In practice, these methods suffer from severe drawbacks:
+Traditional formation control strategies generally enforce rigid geometric shapes (triangles, lines abreast) or rely on time-parameterized trajectories and time-delay following ($t - \tau$). In practice, these methods suffer from severe drawbacks:
 - **Synchronization Brittleness:** Heterogeneous agents, wheel slippage, or localized actuation delays cause agents to lose phase synchronization.
 - **Corner Cutting / Distortion:** Rigid formations cannot negotiate narrow winding corridors.
 - **Cumulative Latency:** Delayed-time followers accumulate errors when the leader slows down, accelerates, or stops.
@@ -25,23 +25,23 @@ Traditional formation control strategies generally enforce rigid geometric shape
 
 Robot Conga is a centralized leader-follower trajectory tracking framework. The leader progresses along a shared reference curve, and reference states for all follower robots are propagated along the curve as a function of the leader's **arc-length displacement**, rather than elapsed time:
 
-$$\forall i \in \{0, 1, \dots, N-1\}, \quad s_{i} = s_{L} - i \cdot d$$
+$$s_i = s_L - i \cdot d, \quad i = 0, 1, \dots, N-1$$
 
 where:
-- $i = 0$ is the leader ($s_0 = s_{L}$),
+- $i = 0$ is the leader ($s_0 = s_L$),
 - $i > 0$ are the followers,
-- $s_{L}$ is the leader's current continuous arc length along the path,
+- $s_L$ is the leader's current continuous arc length along the path,
 - $d$ is the commanded inter-robot spatial separation (e.g., $1.0\text{ m}$).
 
-Each robot receives a reference state $(x_{i}^{*}, y_{i}^{*}, \theta_{i}^{*}, u_{i}^{*}, \omega_{i}^{*})$ corresponding strictly to its arc length $s_{i}$. When the leader pauses ($u_{L} = 0$), $s_{L}$ stops advancing, and all followers naturally come to rest at their designated spatial offsets without time-lapse accumulation.
+Each robot receives a reference state $(x_i^{\ast}, y_i^{\ast}, \theta_i^{\ast}, u_i^{\ast}, \omega_i^{\ast})$ corresponding strictly to its arc length $s_i$. When the leader pauses ($u_L = 0$), $s_L$ stops advancing, and all followers naturally come to rest at their designated spatial offsets without time-lapse accumulation.
 
 ---
 
 ## 3. Spatial Propagation vs. Time-Delay Following
 
-| Characteristic | Traditional Time-Delay Following ($t - \tau$) | Robot Conga Spatial Propagation ($s_{L} - i \cdot d$) |
+| Characteristic | Traditional Time-Delay Following ($t - \tau$) | Robot Conga Spatial Propagation ($s_L - i \cdot d$) |
 |---|---|---|
-| **Progression Variable** | Time $t \in \mathbb{R}^{+}$ | Arc length $s \in \mathbb{R}^{+}$ along curve |
+| **Progression Variable** | Time $t \ge 0$ | Arc length $s \ge 0$ along curve |
 | **Leader Stop Behavior** | Followers keep moving for $\tau$ seconds before stopping | Followers pause synchronously with path displacement |
 | **Velocity Variations** | Spacing stretches at high speed, compresses at low speed | Spacing remains constant ($d$ meters) regardless of speed |
 | **Heterogeneous Dynamics** | Requires identical acceleration profiles to prevent collisions | Accommodates differing platform dynamics natively |
@@ -54,20 +54,24 @@ Each robot receives a reference state $(x_{i}^{*}, y_{i}^{*}, \theta_{i}^{*}, u_
 Each mobile robot is modeled as a non-holonomic unicycle system:
 
 $$\dot{x}(t) = u(t) \cos[\theta(t)]$$
+
 $$\dot{y}(t) = u(t) \sin[\theta(t)]$$
+
 $$\dot{\theta}(t) = \omega(t)$$
 
 where:
-- $(x(t), y(t)) \in \mathbb{R}^{2}$ represents 2D position in the global coordinate frame,
+- $(x(t), y(t))$ represents 2D position in the global coordinate frame,
 - $\theta(t) \in (-\pi, \pi]$ represents the global heading angle,
-- $u(t) \in \mathbb{R}$ is the forward linear velocity control input,
-- $\omega(t) \in \mathbb{R}$ is the angular velocity control input.
+- $u(t)$ is the forward linear velocity control input,
+- $\omega(t)$ is the angular velocity control input.
 
 For each virtual reference agent $i$, the reference trajectory satisfies identical unicycle kinematics:
 
-$$\dot{x}_{i}^{*}(t) = u_{i}^{*}(t) \cos[\theta_{i}^{*}(t)]$$
-$$\dot{y}_{i}^{*}(t) = u_{i}^{*}(t) \sin[\theta_{i}^{*}(t)]$$
-$$\dot{\theta}_{i}^{*}(t) = \omega_{i}^{*}(t)$$
+$$\dot{x}_i^{\ast}(t) = u_i^{\ast}(t) \cos[\theta_i^{\ast}(t)]$$
+
+$$\dot{y}_i^{\ast}(t) = u_i^{\ast}(t) \sin[\theta_i^{\ast}(t)]$$
+
+$$\dot{\theta}_i^{\ast}(t) = \omega_i^{\ast}(t)$$
 
 ---
 
@@ -75,17 +79,21 @@ $$\dot{\theta}_{i}^{*}(t) = \omega_{i}^{*}(t)$$
 
 For each agent, the tracking error vector $\mathbf{e}(t) = [e_1(t), e_2(t), e_3(t)]^{T}$ is defined in the global frame:
 
-$$e_1(t) = x(t) - x^{*}(t)$$
-$$e_2(t) = y(t) - y^{*}(t)$$
-$$e_3(t) = \theta(t) - \theta^{*}(t) \quad (\text{normalized to } [-\pi, \pi))$$
+$$e_1(t) = x(t) - x^{\ast}(t)$$
+
+$$e_2(t) = y(t) - y^{\ast}(t)$$
+
+$$e_3(t) = \theta(t) - \theta^{\ast}(t)$$
 
 Taking the time derivative yields the open-loop error dynamics:
 
-$$\dot{e}_1 = u \cos(\theta) - u^{*} \cos(\theta^{*})$$
-$$\dot{e}_2 = u \sin(\theta) - u^{*} \sin(\theta^{*})$$
-$$\dot{e}_3 = \omega - \omega^{*}$$
+$$\dot{e}_1 = u \cos(\theta) - u^{\ast} \cos(\theta^{\ast})$$
 
-> **Implementation Note:** Normalizing $e_3$ to $[-\pi, \pi)$ via `wrap_to_pi` is an essential engineering safeguard to prevent angle wind-up across the $\pm \pi$ branch cut.
+$$\dot{e}_2 = u \sin(\theta) - u^{\ast} \sin(\theta^{\ast})$$
+
+$$\dot{e}_3 = \omega - \omega^{\ast}$$
+
+> **Implementation Note:** Normalizing $e_3$ to $[-\pi, \pi)$ via `wrap_to_pi` is an essential engineering safeguard implemented in code to prevent angle wind-up across the $\pm \pi$ branch cut.
 
 ---
 
@@ -93,9 +101,9 @@ $$\dot{e}_3 = \omega - \omega^{*}$$
 
 The paper employs a nonlinear state-feedback control law derived via Lyapunov stability analysis (Ailon & Zohar, 2007; Tiwari & Nath, 2025):
 
-$$u(t) = \frac{u^{*}(t) \cos[\theta^{*}(t)] - \lambda_3 e_1(t)}{\cos[\theta^{*}(t) + e_3(t)]}$$
+$$u(t) = \frac{u^{\ast}(t) \cos[\theta^{\ast}(t)] - \lambda_3 e_1(t)}{\cos[\theta^{\ast}(t) + e_3(t)]}$$
 
-$$\omega(t) = \omega^{*}(t) - \lambda_2 e_3(t) - \lambda_1 e_2(t)$$
+$$\omega(t) = \omega^{\ast}(t) - \lambda_2 e_3(t) - \lambda_1 e_2(t)$$
 
 where $\lambda_1, \lambda_2, \lambda_3 > 0$ are positive feedback gains.
 
@@ -104,14 +112,16 @@ where $\lambda_1, \lambda_2, \lambda_3 > 0$ are positive feedback gains.
 Substituting the controller into the unicycle error dynamics yields:
 
 $$\dot{e}_1 = -\lambda_3 e_1$$
-$$\dot{e}_2 = -\lambda_3 e_1 \tan(\theta^{*}) + \frac{u^{*} \sin(e_3)}{\cos(\theta^{*} + e_3)}$$
+
+$$\dot{e}_2 = -\lambda_3 e_1 \tan(\theta^{\ast}) + \frac{u^{\ast} \sin(e_3)}{\cos(\theta^{\ast} + e_3)}$$
+
 $$\dot{e}_3 = -\lambda_1 e_2 - \lambda_2 e_3$$
 
-Under persistent forward motion ($u^{*} > 0$), the Lyapunov candidate function:
+Under persistent forward motion ($u^{\ast} > 0$), the Lyapunov candidate function:
 
-$$V(\mathbf{e}) = \frac{1}{2} \mathbf{e}^{T} \begin{bmatrix} \delta & 0 & 0 \\ 0 & \delta_1 & 1 \\ 0 & 1 & 1 \end{bmatrix} \mathbf{e}$$
+$$V(\mathbf{e}) = \frac{1}{2} \left( \delta e_1^2 + \delta_1 e_2^2 + 2 e_2 e_3 + e_3^2 \right)$$
 
-satisfies $\dot{V}(\mathbf{e}) < 0$ in a local domain $\mathcal{D}$, establishing local exponential stability $\mathbf{e} \to \mathbf{0}$.
+satisfies $\dot{V}(\mathbf{e}) < 0$ in a local domain $\mathcal{D}$ for appropriately chosen constants $\delta, \delta_1 > 0$, establishing local exponential stability $\mathbf{e} \to \mathbf{0}$.
 
 ### Paper Tuning Parameters (Table II)
 
@@ -125,16 +135,16 @@ satisfies $\dot{V}(\mathbf{e}) < 0$ in a local domain $\mathcal{D}$, establishin
 
 ## 7. Arc-Length Propagation
 
-Given a path parameterized by arc length $s$, the reference state for robot $i$ is calculated from the leader's spatial progress $s_{L}$:
+Given a path parameterized by arc length $s$, the reference state for robot $i$ is calculated from the leader's spatial progress $s_L$:
 
-$$s_{i} = s_{L} - i \cdot d$$
+$$s_i = s_L - i \cdot d$$
 
 The continuous path model evaluates:
-- $\mathbf{p}(s_{i}) = (x(s_{i}), y(s_{i}))$
-- $\theta(s_{i}) = \text{atan2}\left(\frac{dy}{ds}, \frac{dx}{ds}\right)$
-- $\kappa(s_{i}) = \frac{d\theta}{ds}$ (signed path curvature)
+- $\mathbf{p}(s_i) = (x(s_i), y(s_i))$
+- $\theta(s_i) = \operatorname{atan2}(y'(s_i), x'(s_i))$
+- $\kappa(s_i) = \theta'(s_i)$ (signed path curvature)
 
-Negative arc-length positions ($s_{i} < 0$) are rejected explicitly by `ReferencePropagator`, preventing followers from evaluating uninitialized path regions prior to the origin.
+Negative arc-length positions ($s_i < 0$) are rejected explicitly by `ReferencePropagator`, preventing followers from evaluating uninitialized path regions prior to the origin.
 
 ---
 
@@ -142,18 +152,18 @@ Negative arc-length positions ($s_{i} < 0$) are rejected explicitly by `Referenc
 
 The reference linear velocity along the trajectory is commanded in real time (e.g., via operator input or mission planner):
 
-$$u_{i}^{*} = V_{\text{cmd}}$$
+$$u_i^{\ast} = V_{\text{cmd}}$$
 
 The reference angular velocity is computed directly from path curvature $\kappa$:
 
-$$\omega_{i}^{*} = V_{\text{cmd}} \cdot \kappa(s_{i})$$
+$$\omega_i^{\ast} = V_{\text{cmd}} \cdot \kappa(s_i)$$
 
 This formulation is mathematically equivalent to the paper's instantaneous radius of curvature formulation:
 
-$$\omega_{i}^{*} = \frac{u_{i}^{*}}{\text{IROC}(s_{i})}, \quad \text{where } \text{IROC} = \frac{1}{\kappa}$$
+$$\omega_i^{\ast} = \frac{u_i^{\ast}}{\text{IROC}(s_i)}, \quad \text{where } \text{IROC} = \frac{1}{\kappa}$$
 
-- For a **StraightPath**: $\kappa = 0 \implies \omega^{*} = 0$.
-- For a **CirclePath** of radius $R$: $\kappa = \pm 1/R \implies \omega^{*} = \pm V_{\text{cmd}} / R$.
+- For a **StraightPath**: $\kappa = 0 \implies \omega^{\ast} = 0$.
+- For a **CirclePath** of radius $R$: $\kappa = \pm 1/R \implies \omega^{\ast} = \pm V_{\text{cmd}} / R$.
 
 ---
 
@@ -235,8 +245,8 @@ To reflect physical indoor robotic platforms (e.g. TurtleBot 4), the simulator i
 4. **Velocity & Acceleration Saturation:**
    - Linear speed clamped to $[-0.30, 0.30]\text{ m/s}$.
    - Angular speed clamped to $[-1.50, 1.50]\text{ rad/s}$.
-   - Linear acceleration clamped to $1.0\text{ m/s}^{2}$.
-   - Angular acceleration clamped to $3.0\text{ rad/s}^{2}$.
+   - Linear acceleration clamped to $1.0\text{ m/s}^2$.
+   - Angular acceleration clamped to $3.0\text{ rad/s}^2$.
 
 ---
 
@@ -244,22 +254,22 @@ To reflect physical indoor robotic platforms (e.g. TurtleBot 4), the simulator i
 
 | Aspect | Directly from Paper (Tiwari & Nath, 2025) | Engineering Implementation Choice |
 |---|---|---|
-| **Controller Equation** | Eq. (8): $u = \frac{u^{*}\cos(\theta^{*}) - \lambda_3 e_1}{\cos(\theta^{*} + e_3)}$ | Exact drop-in implementation in `CongaController.compute` |
+| **Controller Equation** | Eq. (8): feedback law for $u$ and $\omega$ | Exact drop-in implementation in `CongaController.compute` |
 | **Gains** | $\lambda_1=4.5, \lambda_2=7.5, \lambda_3=2.5$ for TurtleBot | Fully configurable constructor parameters with validation |
-| **Spatial Spacing** | $s_{i} = s_{L} - i \cdot d$ | `ReferencePropagator` with explicit negative-s bounds checking |
+| **Spatial Spacing** | $s_i = s_L - i \cdot d$ | `ReferencePropagator` with explicit negative-s bounds checking |
 | **Singularity Guard** | Discussed in Section IV.C (frame rotation) | Explicit `singularity_threshold` and `ControllerSingularityError` |
 | **Heading Normalization**| Not explicitly noted in Eq. (3) | `wrap_to_pi(e3)` safeguarding against $\pm \pi$ angle wind-up |
 | **Simulator Dynamics** | Unicycle kinematics (Eq. 1) | RK1 kinematic integrator with configurable $dt=0.01\text{s}$ |
 | **Actuation Delay** | Acknowledged in Section I as a motivation | $100\text{ ms}$ FIFO delay queue |
-| **Measurement Noise** | Paper assumes mocap/UWB/vision | Gaussian $\sigma_{\text{pos}}=2\text{ cm}, \sigma_{\theta}=2^{\circ}$ at $15\text{ Hz}$ |
+| **Measurement Noise** | Paper assumes mocap/UWB/vision | Gaussian noise ($\sigma_{\text{pos}}=2\text{ cm}, \sigma_{\theta}=2^{\circ}$) at $15\text{ Hz}$ |
 | **Velocity Limits** | Not specified in paper | $v_{\text{max}}=0.30\text{ m/s}, \omega_{\text{max}}=1.50\text{ rad/s}$ for TurtleBot |
 
 ---
 
 ## 13. Current Limitations
 
-1. **Y-Axis Coordinate Singularity:** Equation (8) contains $\cos(\theta^{*} + e_3) = \cos(\theta)$ in the denominator. When the robot's heading approaches $\pm \pi/2$ (traveling parallel to the global Y-axis), the denominator approaches zero. The controller detects this condition and raises `ControllerSingularityError`. The paper notes a local coordinate frame rotation mechanism (Section IV.C), which will be implemented in Phase 3.
-2. **Stationary Lateral Controllability:** By Brockett's Theorem, a driftless non-holonomic unicycle cannot be stabilized to a fixed point in 3D $(x, y, \theta)$ via continuous pure-state feedback. When $u^{*} = 0$, $\dot{e}_2 = 0$. Persistent forward progression ($V_{\text{cmd}} > 0$) is mathematically required for lateral error convergence.
+1. **Y-Axis Coordinate Singularity:** Equation (8) contains $\cos(\theta^{\ast} + e_3) = \cos(\theta)$ in the denominator. When the robot's heading approaches $\pm \pi/2$ (traveling parallel to the global Y-axis), the denominator approaches zero. The controller detects this condition and raises `ControllerSingularityError`. The paper notes a local coordinate frame rotation mechanism (Section IV.C), which will be implemented in Phase 3.
+2. **Stationary Lateral Controllability:** By Brockett's Theorem, a driftless non-holonomic unicycle cannot be stabilized to a fixed point in 3D $(x, y, \theta)$ via continuous pure-state feedback. When $u^{\ast} = 0$, $\dot{e}_2 = 0$. Persistent forward progression ($V_{\text{cmd}} > 0$) is mathematically required for lateral error convergence.
 3. **Centralized Global State Assumption:** The current phase assumes centralized knowledge of agent positions in a global coordinate frame (e.g. Motion Capture or UWB localization).
 
 ---
@@ -307,7 +317,7 @@ Running `examples/conga_demo.py` generates the following plots:
 2. `results/position_error.png`: Euclidean tracking error vs. time for each robot.
 3. `results/heading_error.png`: Absolute heading error (degrees) vs. time for each robot.
 4. `results/inter_robot_spacing.png`: Inter-robot spacing between consecutive pairs compared to the $1.0\text{ m}$ reference line.
-5. `results/arc_length_position.png`: Temporal progression of arc lengths $s_{i}(t)$.
+5. `results/arc_length_position.png`: Temporal progression of arc lengths $s_i(t)$.
 
 ---
 
