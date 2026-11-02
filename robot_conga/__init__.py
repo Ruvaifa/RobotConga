@@ -1,5 +1,6 @@
 """Robot Conga: A Leader-Follower Walking Approach to Sequential Path Following in Multi-Agent Systems."""
 
+from robot_conga.bspline_path import BSplinePath, PathManager
 from robot_conga.controller import CongaController, ControllerSingularityError
 from robot_conga.geometry import angle_difference, clamp, distance, wrap_to_pi
 from robot_conga.metrics import (
@@ -38,6 +39,8 @@ __all__ = [
     "StraightPath",
     "CirclePath",
     "SCurvePath",
+    "BSplinePath",
+    "PathManager",
     "ReferencePropagator",
     "CongaController",
     "ControllerSingularityError",

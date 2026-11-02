@@ -140,12 +140,10 @@ def compute_conga_metrics(
 
     robot_metrics: List[RobotMetrics] = []
     for r_idx in range(simulation_result.num_robots):
-        pos_errs = [
-            simulation_result.get_position_errors(r_idx)[i] for i in valid_indices
-        ]
-        head_errs = [
-            simulation_result.get_heading_errors(r_idx)[i] for i in valid_indices
-        ]
+        all_pos_errs = simulation_result.get_position_errors(r_idx)
+        all_head_errs = simulation_result.get_heading_errors(r_idx)
+        pos_errs = [all_pos_errs[i] for i in valid_indices]
+        head_errs = [all_head_errs[i] for i in valid_indices]
         robot_metrics.append(
             RobotMetrics(
                 robot_idx=r_idx,
