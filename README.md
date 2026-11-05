@@ -169,38 +169,70 @@ $$\omega_i^{\ast} = \frac{u_i^{\ast}}{\text{IROC}(s_i)}, \quad \text{where } \te
 
 ## 9. Software Architecture
 
-The package is organized as a clean ROS 2 Humble `ament_python` package that runs completely independently of ROS runtime libraries:
+`robot_conga` is a ROS 2 **Jazzy** `ament_python` package. The library (everything except the `*_node.py`, `ros_common.py` and `launch_common.py` modules) runs without ROS:
 
 ```
 robot_conga/
-├── package.xml                   # ROS 2 package manifest (format 3)
-├── setup.py                      # ament_python build definition
-├── setup.cfg                     # Script directories & pytest configuration
-├── resource/robot_conga          # Ament resource marker
-├── robot_conga/                  # Reusable mathematical library
-│   ├── __init__.py               # Public API exports
-│   ├── geometry.py               # wrap_to_pi, clamp, distance, angle_difference
-│   ├── models.py                 # Pose, Twist, PathState, ReferenceState
-│   ├── path.py                   # Path, StraightPath, CirclePath, SCurvePath
-│   ├── propagator.py             # ReferencePropagator (spatial arc length)
-│   ├── controller.py             # CongaController (Eq. 8, singularity guard)
-│   ├── simulator.py              # RobotSimulator, CongaSimulator, delay, noise
-│   ├── metrics.py                # RMSE, max error, spacing error analysis
-│   └── plotting.py               # Matplotlib trajectory and error visualizer
-├── test/                         # Comprehensive pytest test suite (31 tests)
-│   ├── test_geometry.py
-│   ├── test_path.py
-│   ├── test_propagator.py
-│   ├── test_controller.py
-│   ├── test_simulator.py
-│   └── test_metrics.py
-├── examples/                     # Ready-to-run simulation experiments
-│   ├── straight_demo.py          # Straight-line tracking (Vcmd = 0.1 m/s)
-│   ├── circle_demo.py            # Circular arc tracking (R = 2.0 m)
-│   ├── conga_demo.py             # 4-robot Conga line (generates 5 plots)
-│   └── singularity_demo.py       # Denominator singularity detection
-└── results/                      # Generated performance plots (.png)
+├── package.xml / setup.py / setup.cfg / resource/robot_conga
+├── robot_conga/
+│   ├── geometry.py, models.py    # wrap_to_pi, clamp, Pose, Twist, ReferenceState
+│   ├── path.py                   # Straight, Circle, SCurve, PrefixedPath (startup lead-in)
+│   ├── bspline_path.py           # BSplinePath, PathManager (offline spline from waypoints)
+│   ├── propagator.py             # ReferencePropagator: s_i = s_L - i d
+│   ├── controller.py             # CongaController (Eq. 8), RotatedCongaController (default),
+│   │                             #   singularity_fallback
+│   ├── simulator.py              # unicycles + delay + noise; conga / time_delay following;
+│   │                             #   SafetyGate; on_step hook (speed profiles, stalls)
+│   ├── metrics.py, plotting.py   # RMSE / spacing metrics, plots
+│   ├── transport.py              # leader path window + s tagging, SampledPath, lidar e-stop
+│   │                             #   check, CSV log format (all ROS-free and unit-tested)
+│   ├── ros_common.py             # WorldPoseSource (odom+TF / PoseStamped), cmd_vel publisher
+│   ├── leader_node.py            # records path, publishes /conga/path + /conga/leader_state
+│   ├── follower_node.py          # rotated Eq. 8 + watchdog + lidar e-stop
+│   ├── logger_node.py            # CSV logger for hardware / gz runs
+│   └── launch_common.py          # node set shared by both launch files
+├── launch/
+│   ├── conga_launch.py           # Gazebo (gz, turtlebot4_gz_bringup) + Conga nodes
+│   └── conga_hardware_launch.py  # real robots only, no simulation
+├── hardware/                     # phase0_bringup.sh (env + checks), fastdds.xml
+├── scripts/analyze_log.py        # logger CSV -> same metrics and plots as the simulator
+├── examples/                     # simulation experiments (see section 15)
+└── test/                         # pytest suite (62 tests)
 ```
+
+### What changed in v0.2 (review fixes)
+
+| Finding | Fix |
+|---|---|
+| Eq. 8 diverges or is singular for path headings beyond about ±75° (cos θ denominator; the −λ1 e2 term has the wrong sign toward −x). A full circle fails. | `RotatedCongaController` evaluates Eq. 8 in a frame rotated by α, the multiple of 90° nearest θ*, switching only when \|θ* − α\| > 45° + 10° hysteresis. Positions are rotated by −α and α is subtracted from both headings; u and ω are body-frame and pass through unchanged. It is the default in the simulator and the follower node. |
+| Each robot's odom frame starts at its own power-on pose. | Shared `world` frame: `WorldPoseSource` takes either a world-frame PoseStamped topic or odom + static TF `world → tb4_i/odom` from the hand-measured start pose (odom is zeroed at node start). |
+| Followers start at s < 0 and jump d ahead. | Startup prefix: a straight lead-in of (N−1)d behind the leader, so s = 0 is at the last robot and the leader starts at s = (N−1)d (`PrefixedPath`, `startup_prefix=True`, and in the leader node). |
+| A singularity freezes the follower permanently. | Last-resort `singularity_fallback`: u = 0, turn toward θ*, so the next cycle can use Eq. 8 again. |
+| Unbounded `nav_msgs/Path`; interpolating spline through noisy history; chord-sum s_L ≠ follower spline length. | The leader sends only a recent window (default (N−1)d + 2 m, hard cap 400 poses ≈ 32 KB), each pose carrying its arc length s in `position.z`. Followers fit smoothing splines x(s), y(s) (smoothing > 0) over the same points, so s_L and s_i share one parameterization. Leader state is a stamped `Vector3Stamped` (s_L, u_L, ω_L). |
+| Jazzy: TwistStamped, gz rename, mixed namespaces. | `cmd_vel_type` parameter (default TwistStamped); `turtlebot4_gz_bringup` (`sim.launch.py`, `turtlebot4_spawn.launch.py`); `tb4_i` namespaces everywhere. |
+| No safety behaviour. | Follower watchdog (pose or leader state older than 0.2 s → zero velocity), lidar e-stop (< 0.3 m in a ±30° front sector, or no scan for 0.5 s → zero velocity), 0.25 m/s hard speed cap, and an optional `SafetyGate` in the simulator. |
+
+### Running on ROS 2 Jazzy
+
+```bash
+colcon build --symlink-install && source install/setup.bash
+
+# Gazebo (gz): world + 3 TurtleBot 4s + Conga nodes; drive tb4_0 with teleop
+ros2 launch robot_conga conga_launch.py num_robots:=3 delta_s:=1.0
+
+# Real robots: measure start poses (x, y, yaw in degrees) in your world frame
+ros2 launch robot_conga conga_hardware_launch.py num_robots:=3 delta_s:=1.0 \
+    start_poses:='0,0,0;-1,0,0;-2,0,0' cmd_vel_type:=TwistStamped pose_source:=odom
+ros2 run teleop_twist_keyboard teleop_twist_keyboard --ros-args \
+    -r cmd_vel:=/tb4_0/cmd_vel -p stamped:=true
+
+# Afterwards: metrics and plots from the logger CSV
+python scripts/analyze_log.py conga_log_<time>.csv --spacing 1.0 --out results/hardware
+```
+
+Topics: `/conga/path` (nav_msgs/Path, transient-local), `/conga/leader_state` (Vector3Stamped: x = s_L, y = u_L, z = ω_L), `/tb4_i/conga/pose` and `/tb4_i/conga/reference` (PoseStamped in `world`, reference z = s_i), `/tb4_i/cmd_vel`. With `pose_source:=topic`, each node instead reads `/tb4_i/world_pose` (PoseStamped, e.g. from an overhead-camera tracker, in any frame with a TF to `world`).
+
+The nodes were smoke-tested on ROS 2 Humble (WSL) against simulated unicycle robots publishing fake odom and scan: followers start on the path, track the leader in the world frame, stop on the watchdog and the lidar e-stop, and the logger CSV feeds `analyze_log.py`. They have **not** yet run on real TurtleBot 4s or in gz.
 
 ---
 
@@ -243,7 +275,7 @@ To reflect physical indoor robotic platforms (e.g. TurtleBot 4), the simulator i
    - *The true robot kinematic state remains completely separate from the noisy measured state.*
 3. **Discrete Measurement Rate:** Sensor updates occur at $15\text{ Hz}$ ($66.7\text{ ms}$ interval), with sample-and-hold between cycles.
 4. **Velocity & Acceleration Saturation:**
-   - Linear speed clamped to $[-0.30, 0.30]\text{ m/s}$.
+   - Linear speed clamped to $[-0.25, 0.25]\text{ m/s}$.
    - Angular speed clamped to $[-1.50, 1.50]\text{ rad/s}$.
    - Linear acceleration clamped to $1.0\text{ m/s}^2$.
    - Angular acceleration clamped to $3.0\text{ rad/s}^2$.
@@ -254,74 +286,87 @@ To reflect physical indoor robotic platforms (e.g. TurtleBot 4), the simulator i
 
 | Aspect | Directly from Paper (Tiwari & Nath, 2025) | Engineering Implementation Choice |
 |---|---|---|
-| **Controller Equation** | Eq. (8): feedback law for $u$ and $\omega$ | Exact drop-in implementation in `CongaController.compute` |
-| **Gains** | $\lambda_1=4.5, \lambda_2=7.5, \lambda_3=2.5$ for TurtleBot | Fully configurable constructor parameters with validation |
-| **Spatial Spacing** | $s_i = s_L - i \cdot d$ | `ReferencePropagator` with explicit negative-s bounds checking |
-| **Singularity Guard** | Discussed in Section IV.C (frame rotation) | Explicit `singularity_threshold` and `ControllerSingularityError` |
-| **Heading Normalization**| Not explicitly noted in Eq. (3) | `wrap_to_pi(e3)` safeguarding against $\pm \pi$ angle wind-up |
-| **Simulator Dynamics** | Unicycle kinematics (Eq. 1) | RK1 kinematic integrator with configurable $dt=0.01\text{s}$ |
-| **Actuation Delay** | Acknowledged in Section I as a motivation | $100\text{ ms}$ FIFO delay queue |
-| **Measurement Noise** | Paper assumes mocap/UWB/vision | Gaussian noise ($\sigma_{\text{pos}}=2\text{ cm}, \sigma_{\theta}=2^{\circ}$) at $15\text{ Hz}$ |
-| **Velocity Limits** | Not specified in paper | $v_{\text{max}}=0.30\text{ m/s}, \omega_{\text{max}}=1.50\text{ rad/s}$ for TurtleBot |
+| **Controller Equation** | Eq. (8): feedback law for $u$ and $\omega$ | `CongaController.compute` exactly; `RotatedCongaController` (default) evaluates it in a 90°-snapped rotated frame |
+| **Gains** | $\lambda_1=4.5, \lambda_2=7.5, \lambda_3=2.5$ for TurtleBot | Configurable constructor / node parameters |
+| **Spatial Spacing** | $s_i = s_L - i \cdot d$ | `ReferencePropagator`; startup prefix puts all robots on the path at $k = 0$ |
+| **Singularity** | Section IV.C rotates the spline frame for steep segments | Not sufficient (the singularity is in the controller's global-frame errors); controller-frame rotation instead, with `ControllerSingularityError` + turn-in-place fallback as a last resort |
+| **Heading Normalization**| Not explicitly noted in Eq. (3) | `wrap_to_pi(e3)` |
+| **Simulator Dynamics** | Unicycle kinematics (Eq. 1) | Euler integration, $dt=0.01\text{ s}$ |
+| **Actuation Delay** | Motivation in Section I | $100\text{ ms}$ FIFO delay queue |
+| **Measurement Noise** | Mocap/UWB/vision assumed | Gaussian ($\sigma_{\text{pos}}=2\text{ cm}, \sigma_{\theta}=2^{\circ}$) at $15\text{ Hz}$ |
+| **Velocity Limits** | Not specified | $v_{\text{max}}=0.25\text{ m/s}$ (hard cap in the nodes), $\omega_{\text{max}}=1.50\text{ rad/s}$ |
+| **Baseline** | Claims an advantage over time-delay following but never tests it | `following="time_delay"` baseline in the simulator, compared in `examples/time_delay_comparison.py` |
 
 ---
 
-## 13. Current Limitations
+## 13. Results
 
-1. **Y-Axis Coordinate Singularity:** Equation (8) contains $\cos(\theta^{\ast} + e_3) = \cos(\theta)$ in the denominator. When the robot's heading approaches $\pm \pi/2$ (traveling parallel to the global Y-axis), the denominator approaches zero. The controller detects this condition and raises `ControllerSingularityError`. The paper notes a local coordinate frame rotation mechanism (Section IV.C), which will be implemented in Phase 3.
-2. **Stationary Lateral Controllability:** By Brockett's Theorem, a driftless non-holonomic unicycle cannot be stabilized to a fixed point in 3D $(x, y, \theta)$ via continuous pure-state feedback. When $u^{\ast} = 0$, $\dot{e}_2 = 0$. Persistent forward progression ($V_{\text{cmd}} > 0$) is mathematically required for lateral error convergence.
-3. **Centralized Global State Assumption:** The current phase assumes centralized knowledge of agent positions in a global coordinate frame (e.g. Motion Capture or UWB localization).
+All numbers come from the simulator with the default noise (2 cm, 2°, 15 Hz) and 100 ms delay, seed 0.
+
+**Any heading.** 20 cm lateral offset on a straight path; mean position error over t = 35–40 s:
+
+| Path heading | 0° | 60° | 90° | 120° | 180° | −90° | −150° |
+|---|---|---|---|---|---|---|---|
+| Plain Eq. 8 | 2.3 cm | 4.1 cm | 4.3 m (diverged) | 3.1 m (diverged) | singular | singular | singular |
+| Rotated (default) | 2.3 cm | 1.1 cm | 2.7 cm | 4.3 cm | 1.2 cm | 1.2 cm | 2.4 cm |
+
+Full circle, 3 robots (R = 1.5 m, v = 0.1 m/s, d = 1 m): position RMSE 1.7–2.1 cm, max 5.5–10 cm. Plain Eq. 8 hits the singularity.
+
+**Conga vs time-delayed following** (`examples/time_delay_comparison.py`, `results/time_delay_vs_conga.png`). 3 robots, d = 1 m. The leader cruises at 0.10 m/s, slows to 0.05, stops for 15 s, then runs at 0.20. The baseline replays the leader's reference from τ_i = i d / v ago, with v the nominal 0.10 m/s:
+
+| Following | Spacing RMSE | Max deviation | Min distance |
+|---|---|---|---|
+| Robot Conga | 1.9–2.2 cm | 7.1 cm | 93 cm |
+| Time delay | 51 cm | 98–102 cm | **1–2 cm (collision)** |
+
+**Safety gate** (`examples/safety_gate_comparison.py`, `results/safety_gate.png`). Follower 1 is physically held from 20 s to 35 s:
+
+| Gate | Max tracking error | Min distance | Worst spacing RMSE |
+|---|---|---|---|
+| Off | 150 cm | **1.6 cm** (follower 2 drives into follower 1) | 52 cm |
+| On (slows above 10 cm, 10 % floor at 30 cm) | 38 cm | 62 cm | 14 cm |
+
+**Startup prefix** (`examples/startup_prefix_demo.py`, `results/startup_prefix.png`): robots lined up behind the leader start on their references. RMSE is 2.8–3.5 cm from t = 0, with no warm-up excluded.
 
 ---
 
-## 14. Verification & Testing
+## 14. Current Limitations
 
-### Running Unit Tests
+1. **The noise floor depends on the frame offset.** With 2 cm / 2° noise and 100 ms delay, the paper's gains make the heading weave by about ±15° (±1° without noise). The steady error is about 2.5 cm when θ* is aligned with the rotated frame and about 4–5 cm at a 30° offset. In about 15 % of random seeds, the 30°-offset cases end above 5 cm. Lower λ2, or a frame that rotates continuously with θ*, would help, but either changes the paper's controller.
+2. **Lateral convergence needs motion.** At u* = 0, Eq. 8 cannot reduce lateral error (Brockett). The safety gate therefore slows to a 10 % floor by default instead of stopping, which avoids a deadlock when the large error is lateral. `SafetyGate(min_ratio=0)` gives a hard stop.
+3. **The safety gate is simulator-only.** In ROS each follower only stops itself (watchdog / e-stop); the leader is driven by a person and does not wait for the line.
+4. **Odom drift.** With `pose_source:=odom`, the world frame is only as good as each robot's odometry plus the hand-measured start pose, and errors grow over a run. An external tracker (`pose_source:=topic`) removes this; an overhead-camera node is not included.
+5. **Watchdog vs Wi-Fi.** A 0.2 s timeout on odom (≈20 Hz) and on leader state over Wi-Fi can trigger on jitter and make followers stutter. If that happens, raise `watchdog_timeout`.
+6. **Unverified hardware assumptions:** the cmd_vel type (default TwistStamped), the RPLIDAR front at −90° in the scan frame (taken from the TB4 Jazzy URDF), and odom QoS (subscribed best-effort, which matches either publisher setting).
+7. **Path transport shortcut:** the arc length s rides in `PoseStamped.position.z`, which avoids a custom message package. This only works for planar robots.
 
-The test suite covers geometry, path generation, propagation, controller stability, unicycle simulation, and metrics.
+---
 
-Using direct `pytest`:
+## 15. Verification & Testing
+
 ```bash
-pytest -v
-```
-
-Using `colcon` (ROS 2 workspace build & test):
-```bash
-colcon build --symlink-install
+pytest -q                                   # 62 passed
 colcon test --packages-select robot_conga --python-testing pytest
-colcon test-result --verbose
 ```
 
-Result: **31 passed, 0 failures, 0 errors**.
-
-### Running Example Demonstrations
+Examples (all write to `results/`):
 
 ```bash
-# Straight-line tracking experiment (Vcmd = 0.1 m/s)
+python examples/conga_demo.py              # 4-robot S-curve, 5 plots
+python examples/circle_demo.py             # full circle (was a ±45° arc before the rotated controller)
 python examples/straight_demo.py
-
-# Circular trajectory experiment (R = 2.0 m)
-python examples/circle_demo.py
-
-# 4-robot Conga multi-agent simulation (generates all 5 plots)
-python examples/conga_demo.py
-
-# Controller singularity detection demo
-python examples/singularity_demo.py
+python examples/singularity_demo.py        # plain Eq. 8 singularity guard
+python examples/startup_prefix_demo.py     # robots start on the path
+python examples/time_delay_comparison.py   # Conga vs time-delayed following
+python examples/safety_gate_comparison.py  # gate on vs off with a blocked follower
 ```
 
-### Generated Output Plots (`results/`)
+### Recommended hardware test order
 
-Running `examples/conga_demo.py` generates the following plots:
-1. `results/xy_trajectory.png`: Ground truth trajectories of leader and 3 followers along the reference path.
-2. `results/position_error.png`: Euclidean tracking error vs. time for each robot.
-3. `results/heading_error.png`: Absolute heading error (degrees) vs. time for each robot.
-4. `results/inter_robot_spacing.png`: Inter-robot spacing between consecutive pairs compared to the $1.0\text{ m}$ reference line.
-5. `results/arc_length_position.png`: Temporal progression of arc lengths $s_i(t)$.
-
----
-
-## 15. Future Roadmap (Phases 3 & 4)
-
-- **Phase 3:** Dynamic local-frame rotation to resolve the Y-axis singularity ($\theta \approx \pm \pi/2$), dynamic B-spline path generation from joystick steering inputs.
-- **Phase 4:** ROS 2 Humble node implementation (`/cmd_vel` publishers, `/odom` subscribers, TF2 transformations, Nav2 integration, and physical TurtleBot 4 deployment).
+1. Per robot: run `hardware/phase0_bringup.sh tb4_i`, check the odom rate and `ros2 topic info -v /tb4_i/cmd_vel` (type), and teleop with the matching `stamped` flag.
+2. E-stop direction: with one follower running, hold a hand in front and confirm `Stopped: obstacle` appears in its log; a hand at the side must not trigger it.
+3. World frame: launch with all robots placed, then compare `ros2 topic echo /tb4_i/conga/pose` against tape-measured positions. Drive the leader 2 m and re-measure to see odom drift.
+4. One follower, straight line, d = 1 m, 0.1 m/s, with someone ready at the e-stop / teleop.
+5. Watchdog: kill the leader node mid-run; the followers should stop within 0.2 s.
+6. Turns through ±90° and 180° (the rotated-controller case), then a full circle.
+7. Three robots, then leader slow / stop / speed-up, to reproduce the spacing comparison on hardware with `analyze_log.py`.

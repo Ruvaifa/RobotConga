@@ -1,6 +1,7 @@
 """Robot Conga controller implementing the paper's Equation (8)."""
 
 import math
+from dataclasses import replace
 from typing import Optional
 
 from robot_conga.geometry import clamp, wrap_to_pi
@@ -31,7 +32,7 @@ class CongaController:
         lambda2: float = 7.5,
         lambda3: float = 2.5,
         singularity_threshold: float = 1e-3,
-        max_linear_velocity: Optional[float] = 0.30,
+        max_linear_velocity: Optional[float] = 0.25,
         max_angular_velocity: Optional[float] = 1.50,
     ) -> None:
         """Initialize controller with gains, singularity threshold, and saturation limits.
@@ -120,3 +121,48 @@ class CongaController:
             omega = clamp(omega, -self.max_angular_velocity, self.max_angular_velocity)
 
         return Twist(linear=u, angular=omega)
+
+
+class RotatedCongaController(CongaController):
+    """Eq. (8) evaluated in a frame rotated by alpha, a multiple of 90 deg nearest theta*.
+
+    Plain Eq. (8) uses global-frame errors and divides by cos(theta), so it only works
+    for path headings within roughly +/-75 deg of +x. Rotating positions by -alpha and
+    subtracting alpha from both headings keeps |theta* - alpha| <= 45 deg + hysteresis,
+    away from the singularity. u and omega are body-frame, so they pass through unchanged.
+    """
+
+    def __init__(self, *args, hysteresis: float = math.radians(10.0), **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.hysteresis = float(hysteresis)
+        self.alpha: Optional[float] = None  # current frame angle, chosen on first call
+
+    def update_frame(self, theta_star: float) -> float:
+        """Return the frame angle, switching only once theta* leaves the hysteresis band."""
+        if self.alpha is None or abs(wrap_to_pi(theta_star - self.alpha)) > math.pi / 4 + self.hysteresis:
+            self.alpha = wrap_to_pi(round(theta_star / (math.pi / 2)) * (math.pi / 2))
+        return self.alpha
+
+    def compute(self, actual_pose: Pose, reference_state: ReferenceState) -> Twist:
+        alpha = self.update_frame(reference_state.pose.theta)
+        c, s = math.cos(alpha), math.sin(alpha)
+
+        def rotate(p: Pose) -> Pose:
+            return Pose(x=c * p.x + s * p.y, y=-s * p.x + c * p.y, theta=wrap_to_pi(p.theta - alpha))
+
+        return super().compute(rotate(actual_pose), replace(reference_state, pose=rotate(reference_state.pose)))
+
+
+def singularity_fallback(
+    actual_pose: Pose,
+    reference_state: ReferenceState,
+    gain: float = 1.5,
+    max_angular_velocity: float = 1.0,
+) -> Twist:
+    """Last-resort command when Eq. (8) is singular: stop translating, turn toward theta*.
+
+    Turning in place shrinks e3, which moves the robot out of the singular set, so the
+    next control cycle can use Eq. (8) again instead of freezing.
+    """
+    e3 = wrap_to_pi(actual_pose.theta - reference_state.pose.theta)
+    return Twist(linear=0.0, angular=clamp(-gain * e3, -max_angular_velocity, max_angular_velocity))

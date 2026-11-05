@@ -23,12 +23,10 @@ def main() -> None:
     curvature = 1.0 / radius
     omega_star = v_cmd * curvature
     print(f"Parameters: R = {radius} m, Curvature = {curvature} 1/m, omega* = {omega_star:.4f} rad/s")
-    print("Note: Trajectory heading is kept away from Y-axis (+/- pi/2) where Equation (8)")
-    print("experiences the paper's known coordinate singularity (addressed in Section IV.C).")
+    print("Full circle: every heading, including +/-90 deg where plain Eq. (8) is singular.")
+    print("The default RotatedCongaController evaluates Eq. (8) in a 90-deg-snapped frame.")
 
-    # Arc spanning heading from -45° to +15° (centered around forward X axis)
-    # For CCW circle: heading = phi + pi/2 -> phi = heading - pi/2
-    start_phi = -math.pi / 2 - math.pi / 4  # -3*pi/4 (-135°) -> heading = -45°
+    start_phi = -math.pi / 2  # bottom of the circle, heading +x
     path = CirclePath(center_x=0.0, center_y=radius, radius=radius, start_angle=start_phi, direction=1)
 
     config = SimulatorConfig(
@@ -49,8 +47,8 @@ def main() -> None:
         config=config,
     )
 
-    duration = 20.0
-    print(f"Simulating circular arc for {duration} seconds...")
+    duration = 2 * math.pi * radius / v_cmd + 5.0  # one full lap plus a margin
+    print(f"Simulating full circle for {duration:.0f} seconds...")
     result = sim.run(duration=duration)
 
     metrics = compute_conga_metrics(result, start_time=5.0)
@@ -60,7 +58,7 @@ def main() -> None:
     print(f"Heading RMSE:         {math.degrees(lead_m.heading_rmse):.2f} deg")
 
     output_path = Path("results") / "circle_demo.png"
-    plot_xy_trajectories(result, str(output_path), title=f"Circular Arc Tracking (R={radius}m, Vcmd={v_cmd}m/s)")
+    plot_xy_trajectories(result, str(output_path), title=f"Full Circle Tracking (R={radius}m, Vcmd={v_cmd}m/s)")
     print(f"Plot saved to: {output_path}")
 
 

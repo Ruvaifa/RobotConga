@@ -1,110 +1,112 @@
-"""ROS 2 Leader Node for Robot Conga sequential path following."""
+"""ROS 2 Leader Node for Robot Conga sequential path following.
+
+The leader is driven by an operator (teleop). This node records its world-frame path and
+publishes, for the followers:
+  - /conga/path (nav_msgs/Path, transient-local): the recent window of waypoints in the world
+    frame, each with its arc length s in pose.position.z (see robot_conga.transport).
+  - /conga/leader_state (geometry_msgs/Vector3Stamped): x = s_L (m), y = u_L (m/s, smoothed
+    ds_L/dt), z = omega_L (rad/s, smoothed dtheta/dt). s_L is on the same waypoint/s
+    representation the followers use.
+and for logging: conga/pose and conga/reference (PoseStamped, world frame, z = s_L).
+"""
 
 import math
 from typing import Optional
 
 try:
-    import rclpy
     from rclpy.node import Node
-    from nav_msgs.msg import Odometry, Path as NavPath
-    from geometry_msgs.msg import PoseStamped, Vector3
+    from rclpy.qos import DurabilityPolicy, QoSProfile
+    from geometry_msgs.msg import PoseStamped, Vector3Stamped
+    from nav_msgs.msg import Path as NavPath
+
+    from robot_conga.ros_common import WorldPoseSource, spin, to_pose_stamped
     HAS_ROS2 = True
 except ImportError:
     HAS_ROS2 = False
     Node = object  # type: ignore
 
+from robot_conga.geometry import wrap_to_pi
+from robot_conga.models import Pose
+from robot_conga.transport import LeaderPathRecorder
+
 
 class LeaderNode(Node):
-    """ROS 2 node tracking leader progress and publishing path and state for followers.
-
-    The leader tracks its own continuous arc length s_L from odometry and publishes:
-      - /conga/path (nav_msgs/Path): Cumulative sequence of waypoints along the trajectory.
-      - /conga/leader_state (geometry_msgs/Vector3):
-          x = leader arc length s_L (m)
-          y = leader forward linear speed u_L (m/s)
-          z = leader angular velocity omega_L (rad/s)
-    """
-
     def __init__(self) -> None:
         if not HAS_ROS2:
-            raise RuntimeError("ROS 2 (rclpy, nav_msgs, geometry_msgs) is required to run LeaderNode.")
-        super().__init__('leader_node')
+            raise RuntimeError("ROS 2 (rclpy, nav_msgs, geometry_msgs, tf2_ros) is required to run LeaderNode.")
+        super().__init__("leader_node")
 
-        # Parameters
-        self.declare_parameter('min_dist', 0.05)  # min distance (m) to record new waypoint
-        self.min_dist = float(self.get_parameter('min_dist').value)
+        self.declare_parameter("num_robots", 3)
+        self.declare_parameter("delta_s", 1.0)
+        self.declare_parameter("min_dist", 0.05)
+        self.declare_parameter("path_window", 0.0)  # 0 -> (N-1)*d + 2 m
+        self.declare_parameter("max_path_points", 400)
+        self.declare_parameter("startup_prefix", True)
+        self.declare_parameter("rate", 20.0)
 
-        # Subscriptions
-        self.odom_sub = self.create_subscription(
-            Odometry,
-            'odom',
-            self.odom_callback,
-            10,
+        n = int(self.get_parameter("num_robots").value)
+        d = float(self.get_parameter("delta_s").value)
+        window = float(self.get_parameter("path_window").value) or (n - 1) * d + 2.0
+        self.recorder = LeaderPathRecorder(
+            min_dist=float(self.get_parameter("min_dist").value),
+            window=window,
+            max_points=int(self.get_parameter("max_path_points").value),
+            prefix_length=(n - 1) * d if self.get_parameter("startup_prefix").value else 0.0,
         )
 
-        # Publishers
-        self.path_pub = self.create_publisher(NavPath, '/conga/path', 10)
-        self.state_pub = self.create_publisher(Vector3, '/conga/leader_state', 10)
+        self.pose_source = WorldPoseSource(self)
+        self.world_frame = self.pose_source.world_frame
+        latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
+        self.path_pub = self.create_publisher(NavPath, "/conga/path", latched)
+        self.state_pub = self.create_publisher(Vector3Stamped, "/conga/leader_state", 10)
+        self.pose_pub = self.create_publisher(PoseStamped, "conga/pose", 10)
+        self.ref_pub = self.create_publisher(PoseStamped, "conga/reference", 10)
 
-        # Internal state
-        self.path_msg = NavPath()
-        self.path_msg.header.frame_id = 'odom'
-        self.last_pose = None
-        self.arc_length: float = 0.0
-        self.current_v: float = 0.0
-        self.current_w: float = 0.0
+        self.prev: Optional[tuple] = None  # (time, s_L, theta)
+        self.u_l = 0.0
+        self.w_l = 0.0
+        self.create_timer(1.0 / float(self.get_parameter("rate").value), self.tick)
+        self.get_logger().info(f"Leader: {n} robots, d = {d:.2f} m, path window {window:.1f} m.")
 
-        self.get_logger().info("Robot Conga LeaderNode initialized.")
+    def tick(self) -> None:
+        pose = self.pose_source.latest
+        if pose is None or self.pose_source.age() > 0.5:
+            return  # followers' watchdogs stop them when leader_state goes stale
+        if self.recorder.add(pose.x, pose.y, pose.theta):
+            self.publish_path()
+        s_l = self.recorder.leader_s(pose.x, pose.y)
 
-    def odom_callback(self, msg: Odometry) -> None:
-        current_pose = msg.pose.pose
-        self.current_v = float(msg.twist.twist.linear.x)
-        self.current_w = float(msg.twist.twist.angular.z)
+        now = self.get_clock().now()
+        t = now.nanoseconds * 1e-9
+        if self.prev is not None and t > self.prev[0]:
+            dt = t - self.prev[0]
+            a = min(1.0, dt / 0.25)  # ~0.25 s low-pass on the finite differences
+            self.u_l += a * ((s_l - self.prev[1]) / dt - self.u_l)
+            self.w_l += a * (wrap_to_pi(pose.theta - self.prev[2]) / dt - self.w_l)
+        self.prev = (t, s_l, pose.theta)
 
-        if self.last_pose is None:
-            self.last_pose = current_pose
-            self.add_pose_to_path(current_pose)
-            return
+        msg = Vector3Stamped()
+        msg.header.stamp = now.to_msg()
+        msg.header.frame_id = self.world_frame
+        msg.vector.x, msg.vector.y, msg.vector.z = float(s_l), float(max(self.u_l, 0.0)), float(self.w_l)
+        self.state_pub.publish(msg)
+        self.pose_pub.publish(to_pose_stamped(self, pose, self.world_frame))
+        self.ref_pub.publish(to_pose_stamped(self, pose, self.world_frame, z=s_l))
 
-        dx = float(current_pose.position.x - self.last_pose.position.x)
-        dy = float(current_pose.position.y - self.last_pose.position.y)
-        dist = math.sqrt(dx * dx + dy * dy)
-
-        if dist >= self.min_dist:
-            self.arc_length += dist
-            self.last_pose = current_pose
-            self.add_pose_to_path(current_pose)
-            self.path_pub.publish(self.path_msg)
-
-        # Publish state (x = s_L, y = u_L, z = omega_L)
-        state_msg = Vector3()
-        state_msg.x = float(self.arc_length)
-        state_msg.y = float(self.current_v)
-        state_msg.z = float(self.current_w)
-        self.state_pub.publish(state_msg)
-
-    def add_pose_to_path(self, pose) -> None:
-        ps = PoseStamped()
-        ps.header.stamp = self.get_clock().now().to_msg()
-        ps.header.frame_id = 'odom'
-        ps.pose = pose
-        self.path_msg.poses.append(ps)
+    def publish_path(self) -> None:
+        msg = NavPath()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = self.world_frame
+        for s, x, y in self.recorder.points:
+            msg.poses.append(to_pose_stamped(self, Pose(x, y, 0.0), self.world_frame, z=s))
+        self.path_pub.publish(msg)
 
 
 def main(args=None) -> None:
     if not HAS_ROS2:
-        raise RuntimeError("ROS 2 (rclpy, nav_msgs, geometry_msgs) is required to run LeaderNode.")
-    rclpy.init(args=args)
-    node = LeaderNode()
-    try:
-        rclpy.spin(node)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        node.destroy_node()
-        rclpy.shutdown()
+        raise RuntimeError("ROS 2 is required to run LeaderNode.")
+    spin(LeaderNode)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
-

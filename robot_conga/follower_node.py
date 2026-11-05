@@ -1,173 +1,187 @@
-"""ROS 2 Follower Node for Robot Conga sequential path following."""
+"""ROS 2 Follower Node for Robot Conga sequential path following.
+
+Tracks s_i = s_L - i * delta_s on the leader's published path with the frame-rotated
+Eq. (8) controller (RotatedCongaController).
+
+Subscribes:
+  - pose (see WorldPoseSource): odom + static TF, or a world-frame PoseStamped topic
+  - /conga/path (nav_msgs/Path): leader waypoint window, s in pose.position.z
+  - /conga/leader_state (geometry_msgs/Vector3Stamped): x = s_L, y = u_L, z = omega_L
+  - scan (sensor_msgs/LaserScan): front e-stop
+Publishes:
+  - cmd_vel (Twist or TwistStamped, parameter cmd_vel_type)
+  - conga/pose, conga/reference (PoseStamped, world frame; reference z = s_i) for logging
+
+Safety, checked every cycle before the controller runs (any failure -> zero velocity):
+  - watchdog: pose or leader state older than watchdog_timeout (0.2 s)
+  - e-stop: obstacle closer than estop_distance (0.3 m) in front, or no scan for scan_timeout
+  - s_i outside the received path window
+The singularity guard is a last resort: if Eq. (8) is singular even in the rotated frame,
+the robot turns in place toward theta* (singularity_fallback) instead of freezing.
+"""
 
 import math
 from typing import Optional
 
 try:
-    import rclpy
     from rclpy.node import Node
-    from nav_msgs.msg import Odometry, Path as NavPath
-    from geometry_msgs.msg import Twist as RosTwist, Vector3
+    from rclpy.qos import DurabilityPolicy, QoSProfile, qos_profile_sensor_data
+    from rclpy.time import Time
+    from geometry_msgs.msg import PoseStamped, Vector3Stamped
+    from nav_msgs.msg import Path as NavPath
+    from sensor_msgs.msg import LaserScan
+
+    from robot_conga.ros_common import (
+        MAX_SAFE_SPEED,
+        WorldPoseSource,
+        make_cmd_vel_publisher,
+        spin,
+        to_pose_stamped,
+    )
     HAS_ROS2 = True
 except ImportError:
     HAS_ROS2 = False
     Node = object  # type: ignore
 
-from robot_conga.bspline_path import PathManager
-from robot_conga.controller import CongaController, ControllerSingularityError
-from robot_conga.geometry import wrap_to_pi
-from robot_conga.models import Pose, Twist
+from robot_conga.controller import ControllerSingularityError, RotatedCongaController, singularity_fallback
+from robot_conga.transport import SampledPath, front_min_range
 
 
 class FollowerNode(Node):
-    """ROS 2 node for a follower robot in the Robot Conga line.
-
-    Configured for 4-robot conga line (1 leader + 3 followers) with default 1.0 m spacing.
-    Tracks spatial arc-length offset:
-        s_i = s_L - i * delta_s
-
-    Subscribes to:
-      - odom (nav_msgs/Odometry): Follower odometry
-      - /conga/path (nav_msgs/Path): Shared leader trajectory waypoints
-      - /conga/leader_state (geometry_msgs/Vector3): Leader progress (x=s_L, y=u_L, z=omega_L)
-
-    Publishes to:
-      - cmd_vel (geometry_msgs/Twist): Commanded unicycle velocity inputs (u, omega)
-    """
-
     def __init__(self) -> None:
         if not HAS_ROS2:
-            raise RuntimeError("ROS 2 (rclpy, nav_msgs, geometry_msgs) is required to run FollowerNode.")
-        super().__init__('follower_node')
+            raise RuntimeError("ROS 2 (rclpy, nav_msgs, geometry_msgs, sensor_msgs, tf2_ros) is required.")
+        super().__init__("follower_node")
 
-        # Parameters
-        self.declare_parameter('follower_index', 1)
-        self.declare_parameter('delta_s', 1.0)
-        self.declare_parameter('lambda1', 4.5)
-        self.declare_parameter('lambda2', 7.5)
-        self.declare_parameter('lambda3', 2.5)
-        self.declare_parameter('max_linear_velocity', 0.30)
-        self.declare_parameter('max_angular_velocity', 1.50)
-        self.declare_parameter('singularity_threshold', 1e-3)
+        params = {
+            "follower_index": 1,
+            "delta_s": 1.0,
+            "lambda1": 4.5,
+            "lambda2": 7.5,
+            "lambda3": 2.5,
+            "max_linear_velocity": MAX_SAFE_SPEED,
+            "max_angular_velocity": 1.5,
+            "singularity_threshold": 1e-3,
+            "cmd_vel_type": "TwistStamped",
+            "rate": 20.0,
+            "watchdog_timeout": 0.2,
+            "path_smoothing_std": 0.01,
+            "use_estop": True,
+            "estop_distance": 0.3,
+            "estop_half_angle_deg": 30.0,
+            "scan_front_angle_deg": -90.0,  # TB4 RPLIDAR is yawed +90 deg: robot front = -90 deg in scan frame
+            "scan_timeout": 0.5,
+        }
+        for name, default in params.items():
+            self.declare_parameter(name, default)
+        p = {name: self.get_parameter(name).value for name in params}
+        self.p = p
 
-        self.idx = int(self.get_parameter('follower_index').value)
-        self.delta_s = float(self.get_parameter('delta_s').value)
-        l1 = float(self.get_parameter('lambda1').value)
-        l2 = float(self.get_parameter('lambda2').value)
-        l3 = float(self.get_parameter('lambda3').value)
-        v_max = float(self.get_parameter('max_linear_velocity').value)
-        w_max = float(self.get_parameter('max_angular_velocity').value)
-        sing_thresh = float(self.get_parameter('singularity_threshold').value)
-
-        self.target_offset = self.idx * self.delta_s
-
-        # Initialize RobotConga controller with Paper Eq. 8 and singularity guard
-        self.controller = CongaController(
-            lambda1=l1,
-            lambda2=l2,
-            lambda3=l3,
-            singularity_threshold=sing_thresh,
-            max_linear_velocity=v_max,
-            max_angular_velocity=w_max,
-        )
-        self.path_manager = PathManager()
-
-        # State variables
-        self.current_pose: Optional[Pose] = None
-        self.leader_s: float = 0.0
-        self.leader_u: float = 0.0
-        self.num_path_points: int = 0
-
-        # Subscriptions
-        self.odom_sub = self.create_subscription(
-            Odometry,
-            'odom',
-            self.odom_callback,
-            10,
-        )
-        self.path_sub = self.create_subscription(
-            NavPath,
-            '/conga/path',
-            self.path_callback,
-            10,
-        )
-        self.leader_state_sub = self.create_subscription(
-            Vector3,
-            '/conga/leader_state',
-            self.leader_state_callback,
-            10,
+        self.idx = int(p["follower_index"])
+        self.offset = self.idx * float(p["delta_s"])
+        self.controller = RotatedCongaController(
+            lambda1=float(p["lambda1"]),
+            lambda2=float(p["lambda2"]),
+            lambda3=float(p["lambda3"]),
+            singularity_threshold=float(p["singularity_threshold"]),
+            max_linear_velocity=min(float(p["max_linear_velocity"]), MAX_SAFE_SPEED),
+            max_angular_velocity=float(p["max_angular_velocity"]),
         )
 
-        # Publisher
-        self.cmd_pub = self.create_publisher(RosTwist, 'cmd_vel', 10)
+        self.pose_source = WorldPoseSource(self)
+        self.world_frame = self.pose_source.world_frame
+        self.path: Optional[SampledPath] = None
+        self.leader_s = 0.0
+        self.leader_u = 0.0
+        self.leader_rx: Optional[Time] = None
+        self.front_range = math.inf
+        self.scan_rx: Optional[Time] = None
 
-        # 50 Hz control loop timer
-        self.timer = self.create_timer(0.02, self.control_loop)
+        latched = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL)
+        self.create_subscription(NavPath, "/conga/path", self.on_path, latched)
+        self.create_subscription(Vector3Stamped, "/conga/leader_state", self.on_leader_state, 10)
+        if p["use_estop"]:
+            self.create_subscription(LaserScan, "scan", self.on_scan, qos_profile_sensor_data)
+
+        self.publish_cmd = make_cmd_vel_publisher(self, p["cmd_vel_type"])
+        self.pose_pub = self.create_publisher(PoseStamped, "conga/pose", 10)
+        self.ref_pub = self.create_publisher(PoseStamped, "conga/reference", 10)
+        self.create_timer(1.0 / float(p["rate"]), self.control_loop)
         self.get_logger().info(
-            f"Robot Conga Follower {self.idx} initialized with spatial offset {self.target_offset:.2f} m."
+            f"Follower {self.idx}: offset {self.offset:.2f} m, cmd_vel type {p['cmd_vel_type']}, "
+            f"pose source {self.pose_source.mode}."
         )
 
-    def odom_callback(self, msg: Odometry) -> None:
-        p = msg.pose.pose.position
-        q = msg.pose.pose.orientation
-        siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
-        cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
-        theta = wrap_to_pi(math.atan2(siny_cosp, cosy_cosp))
-        self.current_pose = Pose(x=float(p.x), y=float(p.y), theta=theta)
+    def _age(self, stamp: Optional[Time]) -> float:
+        return math.inf if stamp is None else (self.get_clock().now() - stamp).nanoseconds * 1e-9
 
-    def path_callback(self, msg: NavPath) -> None:
-        pts = [(float(p.pose.position.x), float(p.pose.position.y)) for p in msg.poses]
-        if len(pts) != self.num_path_points and len(pts) >= 4:
-            if self.path_manager.update_path(pts):
-                self.num_path_points = len(pts)
+    def on_path(self, msg: NavPath) -> None:
+        pts = [(ps.pose.position.z, ps.pose.position.x, ps.pose.position.y) for ps in msg.poses]
+        if len(pts) < 4:
+            return
+        s, x, y = zip(*pts)
+        try:
+            self.path = SampledPath(s, x, y, smoothing_std=float(self.p["path_smoothing_std"]))
+        except Exception as e:  # keep the previous path rather than dropping out
+            self.get_logger().warn(f"Path fit failed, keeping previous path: {e}", throttle_duration_sec=2.0)
 
-    def leader_state_callback(self, msg: Vector3) -> None:
-        self.leader_s = float(msg.x)
-        self.leader_u = float(msg.y)
+    def on_leader_state(self, msg: Vector3Stamped) -> None:
+        self.leader_s = float(msg.vector.x)
+        self.leader_u = max(0.0, float(msg.vector.y))
+        self.leader_rx = self.get_clock().now()
+
+    def on_scan(self, msg: LaserScan) -> None:
+        self.front_range = front_min_range(
+            msg.ranges, msg.angle_min, msg.angle_increment,
+            math.radians(float(self.p["scan_front_angle_deg"])),
+            math.radians(float(self.p["estop_half_angle_deg"])),
+            msg.range_min, msg.range_max,
+        )
+        self.scan_rx = self.get_clock().now()
+
+    def stop(self, reason: str) -> None:
+        self.publish_cmd(0.0, 0.0)
+        self.get_logger().warn(f"Stopped: {reason}", throttle_duration_sec=2.0)
 
     def control_loop(self) -> None:
-        if self.current_pose is None or self.num_path_points < 4:
-            return
+        timeout = float(self.p["watchdog_timeout"])
+        pose = self.pose_source.latest
+        if self.pose_source.age() > timeout:
+            return self.stop(f"pose older than {timeout} s")
+        if self._age(self.leader_rx) > timeout:
+            return self.stop(f"leader state older than {timeout} s")
+        if self.p["use_estop"]:
+            if self._age(self.scan_rx) > float(self.p["scan_timeout"]):
+                return self.stop("no lidar scan")
+            if self.front_range < float(self.p["estop_distance"]):
+                return self.stop(f"obstacle {self.front_range:.2f} m ahead")
+        if self.path is None:
+            return self.stop("no path yet")
 
-        target_s = self.leader_s - self.target_offset
-
-        # Follower waits until the leader has advanced past its spatial offset
-        if target_s <= 0.0:
-            self.publish_cmd(0.0, 0.0)
-            return
-
-        ref_state = self.path_manager.get_reference_state(target_s, self.leader_u)
-        if ref_state is None:
-            return
+        target_s = self.leader_s - self.offset
+        ref = self.path.reference(target_s, self.leader_u)
+        if ref is None:
+            return self.stop(f"s_i = {target_s:.2f} m is outside the path window (starts {self.path.s0:.2f} m)")
 
         try:
-            cmd = self.controller.compute(self.current_pose, ref_state)
-            self.publish_cmd(cmd.linear, cmd.angular)
+            cmd = self.controller.compute(pose, ref)
         except ControllerSingularityError as e:
-            self.get_logger().warn(f"Singularity detected: {e}. Halting linear motion for safety.")
-            self.publish_cmd(0.0, 0.0)
+            self.get_logger().warn(f"Singular even in rotated frame ({e}); turning toward theta*.",
+                                   throttle_duration_sec=1.0)
+            cmd = singularity_fallback(pose, ref, max_angular_velocity=float(self.p["max_angular_velocity"]))
+        self.publish_cmd(cmd.linear, cmd.angular)
+        self.pose_pub.publish(to_pose_stamped(self, pose, self.world_frame))
+        self.ref_pub.publish(to_pose_stamped(self, ref.pose, self.world_frame, z=ref.s))
 
-    def publish_cmd(self, u: float, omega: float) -> None:
-        msg = RosTwist()
-        msg.linear.x = float(u)
-        msg.angular.z = float(omega)
-        self.cmd_pub.publish(msg)
+    def on_shutdown(self) -> None:
+        self.publish_cmd(0.0, 0.0)
 
 
 def main(args=None) -> None:
     if not HAS_ROS2:
-        raise RuntimeError("ROS 2 (rclpy, nav_msgs, geometry_msgs) is required to run FollowerNode.")
-    rclpy.init(args=args)
-    node = FollowerNode()
-    try:
-        rclpy.spin(node)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        node.destroy_node()
-        rclpy.shutdown()
+        raise RuntimeError("ROS 2 is required to run FollowerNode.")
+    spin(FollowerNode)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
-

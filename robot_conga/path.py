@@ -312,3 +312,35 @@ class SCurvePath(Path):
             return -1.0 / self.radius
         else:
             return 0.0
+
+
+class PrefixedPath(Path):
+    """A base path with a straight lead-in of `length` metres ending at the base path's start.
+
+    The lead-in runs along the base path's initial heading, so robots lined up behind the
+    start at spacing d sit ON the path: s = 0 is the last robot and the leader starts at
+    s = length = (N - 1) * d, as in the paper's k = 0 configuration.
+    """
+
+    def __init__(self, base: Path, length: float) -> None:
+        if length < 0.0:
+            raise ValueError(f"Prefix length must be non-negative, got {length}")
+        self.base = base
+        self.length = float(length)
+        self._start = base.evaluate(0.0)
+
+    def point(self, s: float) -> Tuple[float, float]:
+        self._validate_s(s)
+        if s >= self.length:
+            return self.base.point(s - self.length)
+        back = self.length - s
+        th = self._start.theta
+        return self._start.x - back * math.cos(th), self._start.y - back * math.sin(th)
+
+    def heading(self, s: float) -> float:
+        self._validate_s(s)
+        return self.base.heading(s - self.length) if s >= self.length else self._start.theta
+
+    def curvature(self, s: float) -> float:
+        self._validate_s(s)
+        return self.base.curvature(s - self.length) if s >= self.length else 0.0

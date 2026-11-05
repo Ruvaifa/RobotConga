@@ -2,7 +2,7 @@
 <?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
 <package format="3">
   <name>robot_conga</name>
-  <version>0.1.0</version>
+  <version>0.2.0</version>
   <description>Robot Conga: A Leader-Follower Walking Approach to Sequential Path Following in Multi-Agent Systems</description>
   <maintainer email="dev@robotconga.org">Robot Conga Team</maintainer>
   <license>Apache-2.0</license>
@@ -13,6 +13,13 @@
   <depend>geometry_msgs</depend>
   <depend>nav_msgs</depend>
   <depend>std_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>tf2_ros</depend>
+  <exec_depend>launch</exec_depend>
+  <exec_depend>launch_ros</exec_depend>
+  <exec_depend>python3-numpy</exec_depend>
+  <exec_depend>python3-scipy</exec_depend>
+  <exec_depend>python3-matplotlib</exec_depend>
 
   <test_depend>ament_copyright</test_depend>
   <test_depend>ament_flake8</test_depend>

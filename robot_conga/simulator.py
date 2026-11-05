@@ -1,16 +1,17 @@
 """ROS-independent unicycle simulator with delay and measurement noise."""
 
+import bisect
 from collections import deque
 from dataclasses import dataclass, field
 import math
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
-from robot_conga.controller import CongaController
+from robot_conga.controller import CongaController, RotatedCongaController
 from robot_conga.geometry import clamp, distance, wrap_to_pi
 from robot_conga.models import Pose, ReferenceState, Twist
-from robot_conga.path import Path
+from robot_conga.path import Path, PrefixedPath
 from robot_conga.propagator import ReferencePropagator
 
 
@@ -31,7 +32,7 @@ class SimulatorConfig:
         seed: Random seed for reproducible noise generation.
     """
     dt: float = 0.01
-    max_linear_velocity: float = 0.30
+    max_linear_velocity: float = 0.25
     max_angular_velocity: float = 1.50
     max_linear_acceleration: Optional[float] = 1.0
     max_angular_acceleration: Optional[float] = 3.0
@@ -40,6 +41,24 @@ class SimulatorConfig:
     heading_noise_std: float = math.radians(2.0)  # 2 degrees
     measurement_frequency: float = 15.0  # 15 Hz
     seed: Optional[int] = None
+
+
+@dataclass
+class SafetyGate:
+    """Slows the leader's reference progression when any robot's tracking error grows.
+
+    The speed ratio applied to ds_L/dt (and to every u*) is 1 below `slow_error`, falls
+    linearly to `min_ratio` at `stop_error`, and stays there above it. min_ratio = 0 stops
+    the line outright; a small positive floor avoids a deadlock when the large error is
+    lateral, which Eq. (8) cannot reduce at u* = 0.
+    """
+    slow_error: float = 0.10
+    stop_error: float = 0.30
+    min_ratio: float = 0.1
+
+    def ratio(self, max_tracking_error: float) -> float:
+        span = self.stop_error - self.slow_error
+        return clamp((self.stop_error - max_tracking_error) / span, self.min_ratio, 1.0)
 
 
 class RobotSimulator:
@@ -75,6 +94,9 @@ class RobotSimulator:
         # Actuation delay queue: stores (time_to_apply, Twist)
         self.command_queue: deque[Tuple[float, Twist]] = deque()
         self.active_command = Twist(linear=0.0, angular=0.0)
+
+        # Disturbance hook: a stalled robot is physically held in place (wheels blocked).
+        self.stalled = False
 
     def _generate_measurement(self, pose: Pose) -> Pose:
         """Add Gaussian measurement noise to true pose."""
@@ -149,6 +171,8 @@ class RobotSimulator:
         cur_omega = clamp(cur_omega, -self.config.max_angular_velocity, self.config.max_angular_velocity)
 
         self.current_twist = Twist(linear=cur_u, angular=cur_omega)
+        if self.stalled:
+            self.current_twist = Twist(linear=0.0, angular=0.0)
 
         # 6. Unicycle dynamics integration for true pose
         new_x = self.true_pose.x + self.current_twist.linear * math.cos(self.true_pose.theta) * dt
@@ -170,6 +194,7 @@ class SimulationStep:
     reference_states: List[ReferenceState]
     command_twists: List[Twist]
     actual_twists: List[Twist]
+    speed_ratio: float = 1.0
 
 
 @dataclass
@@ -237,6 +262,9 @@ class CongaSimulator:
         initial_poses: Optional[List[Pose]] = None,
         controllers: Optional[List[CongaController]] = None,
         config: Optional[SimulatorConfig] = None,
+        startup_prefix: bool = False,
+        following: str = "conga",
+        gate: Optional[SafetyGate] = None,
     ) -> None:
         """Initialize Conga multi-robot simulator.
 
@@ -247,9 +275,27 @@ class CongaSimulator:
             v_cmd: Leader commanded progression speed (m/s).
             initial_leader_s: Starting leader arc-length position.
             initial_poses: Initial poses for all robots (defaults to reference poses).
-            controllers: List of controllers (defaults to standard CongaController).
+            controllers: List of controllers (defaults to RotatedCongaController).
             config: Simulator configuration parameters.
+            startup_prefix: Prepend a straight lead-in of (N-1)*d so s = 0 is at the last
+                robot and every robot starts on the path (see PrefixedPath).
+            following: "conga" (s_i = s_L - i*d) or "time_delay" (baseline: robot i replays
+                the leader's reference from tau_i = i*d/v_cmd seconds ago).
+            gate: Optional SafetyGate slowing s_L when tracking errors grow.
         """
+        if following not in ("conga", "time_delay"):
+            raise ValueError(f"following must be 'conga' or 'time_delay', got {following!r}")
+        if startup_prefix:
+            path = PrefixedPath(path, (num_robots - 1) * spacing)
+        self.following = following
+        self.gate = gate
+        self.speed_ratio = 1.0
+        self.time = 0.0
+        self.v_nominal = float(v_cmd)
+        # Leader reference history (time, s_L, u*) for the time-delay baseline
+        self._hist_t: List[float] = []
+        self._hist_s: List[float] = []
+        self._hist_v: List[float] = []
         self.path = path
         self.num_robots = num_robots
         self.spacing = spacing
@@ -282,7 +328,7 @@ class CongaSimulator:
         # Setup controllers
         if controllers is None:
             self.controllers = [
-                CongaController(
+                RotatedCongaController(
                     lambda1=4.5,
                     lambda2=7.5,
                     lambda3=2.5,
@@ -312,11 +358,40 @@ class CongaSimulator:
             )
             self.robots.append(robot)
 
-    def run(self, duration: float) -> SimulationResult:
+    def _leader_history(self, t: float) -> Tuple[float, float]:
+        """Leader (s_L, u*) at past time t; before t=0 the leader is assumed to cruise at v_cmd."""
+        if not self._hist_t or t < self._hist_t[0]:
+            t0 = self._hist_t[0] if self._hist_t else self.time
+            s0 = self._hist_s[0] if self._hist_s else self.leader_s
+            return s0 - self.v_nominal * (t0 - t), self.v_nominal
+        k = bisect.bisect_right(self._hist_t, t) - 1
+        if k + 1 < len(self._hist_t):
+            frac = (t - self._hist_t[k]) / (self._hist_t[k + 1] - self._hist_t[k])
+            return self._hist_s[k] + frac * (self._hist_s[k + 1] - self._hist_s[k]), self._hist_v[k]
+        return self._hist_s[k], self._hist_v[k]
+
+    def _references(self, v: float) -> List[ReferenceState]:
+        if self.following == "conga":
+            return self.propagator.propagate(self.leader_s, v)
+        refs = []
+        for i in range(self.num_robots):
+            s_i, v_i = self._leader_history(self.time - i * self.spacing / self.v_nominal)
+            refs.append(self.propagator.get_reference_state(max(s_i, 0.0), v_i))
+        return refs
+
+    def run(
+        self,
+        duration: float,
+        on_step: Optional[Callable[["CongaSimulator", float], None]] = None,
+    ) -> SimulationResult:
         """Run the multi-robot simulation for a specified duration in seconds.
+
+        Calling run() again continues from where the previous call stopped.
 
         Args:
             duration: Total duration of simulation run (seconds).
+            on_step: Optional callback(sim, t) run at the start of every step, e.g. to
+                change sim.v_cmd (leader speed profile) or stall a robot.
 
         Returns:
             SimulationResult containing recorded trajectory and telemetry data.
@@ -327,10 +402,17 @@ class CongaSimulator:
             desired_spacing=self.spacing,
         )
 
-        current_time = 0.0
         for _ in range(num_steps):
-            # Advance leader reference along path
-            ref_states = self.propagator.propagate(self.leader_s, self.v_cmd)
+            current_time = self.time
+            if on_step is not None:
+                on_step(self, current_time)
+
+            # Effective progression speed (reduced by the safety gate, if any)
+            v = self.v_cmd * self.speed_ratio
+            self._hist_t.append(current_time)
+            self._hist_s.append(self.leader_s)
+            self._hist_v.append(v)
+            ref_states = self._references(v)
 
             true_poses: List[Pose] = []
             meas_poses: List[Pose] = []
@@ -352,12 +434,18 @@ class CongaSimulator:
                 reference_states=ref_states,
                 command_twists=cmd_twists,
                 actual_twists=act_twists,
+                speed_ratio=self.speed_ratio,
             )
             result.times.append(current_time)
             result.steps.append(step)
 
+            # Gate on the measured error, as a real robot would
+            if self.gate is not None:
+                worst = max(distance(m, r.pose) for m, r in zip(meas_poses, ref_states))
+                self.speed_ratio = self.gate.ratio(worst)
+
             # Advance simulation clock and leader arc-length
-            self.leader_s += self.v_cmd * self.config.dt
-            current_time += self.config.dt
+            self.leader_s += v * self.config.dt
+            self.time += self.config.dt
 
         return result

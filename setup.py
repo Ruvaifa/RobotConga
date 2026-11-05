@@ -6,7 +6,7 @@ package_name = 'robot_conga'
 
 setup(
     name=package_name,
-    version='0.1.0',
+    version='0.2.0',
     packages=find_packages(exclude=['test', 'test.*']),
     data_files=[
         ('share/ament_index/resource_index/packages',
@@ -26,6 +26,7 @@ setup(
         'console_scripts': [
             'leader_node = robot_conga.leader_node:main',
             'follower_node = robot_conga.follower_node:main',
+            'logger_node = robot_conga.logger_node:main',
         ],
     },
 )

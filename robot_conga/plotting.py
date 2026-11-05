@@ -186,3 +186,30 @@ def generate_all_plots(result: SimulationResult, output_dir: str = "results") ->
     plot_inter_robot_spacing(result, str(out / "inter_robot_spacing.png"))
     plot_arc_length_positions(result, str(out / "arc_length_position.png"))
     plt.close("all")
+
+
+def plot_spacing_comparison(
+    results: "dict[str, SimulationResult]",
+    output_path: Optional[str] = None,
+    title: str = "Inter-Robot Spacing Comparison",
+) -> plt.Figure:
+    """Stack one inter-robot spacing panel per labelled run, sharing the time axis."""
+    fig, axes = plt.subplots(len(results), 1, figsize=(8, 3.2 * len(results)), dpi=150, sharex=True, squeeze=False)
+    colors = ["#ff7f0e", "#2ca02c", "#d62728", "#9467bd"]
+    for ax, (label, result) in zip(axes[:, 0], results.items()):
+        ax.axhline(result.desired_spacing, color="black", linestyle="--", linewidth=1.2, label="Desired")
+        for i, (pair, dists) in enumerate(result.get_inter_robot_distances().items()):
+            ax.plot(result.times, dists, color=colors[i % len(colors)], linewidth=1.6, label=f"Robot {pair[0]} - {pair[1]}")
+        ax.set_title(label, fontsize=10, fontweight="bold")
+        ax.set_ylabel("Distance [m]")
+        ax.set_ylim(bottom=0.0)
+        ax.grid(True, linestyle=":", alpha=0.6)
+        ax.legend(loc="best", fontsize=8)
+    axes[-1, 0].set_xlabel("Time [s]")
+    fig.suptitle(title, fontsize=12, fontweight="bold")
+    fig.tight_layout()
+
+    if output_path:
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(output_path)
+    return fig
