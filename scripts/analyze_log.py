@@ -1,4 +1,4 @@
-"""Turn a Robot Conga logger CSV (hardware or gz run) into the simulator's metrics and plots.
+"""Turn a Robot Conga logger CSV (hardware or Ignition Gazebo run) into the simulator's metrics and plots.
 
 Usage:
     python scripts/analyze_log.py conga_log_123.csv --spacing 1.0 --out results/hardware --warmup 5

@@ -169,7 +169,7 @@ $$\omega_i^{\ast} = \frac{u_i^{\ast}}{\text{IROC}(s_i)}, \quad \text{where } \te
 
 ## 9. Software Architecture
 
-`robot_conga` is a ROS 2 **Jazzy** `ament_python` package. The library (everything except the `*_node.py`, `ros_common.py` and `launch_common.py` modules) runs without ROS:
+`robot_conga` is a ROS 2 **Humble** `ament_python` package. The library (everything except the `*_node.py`, `ros_common.py` and `launch_common.py` modules) runs without ROS:
 
 ```
 robot_conga/
@@ -189,10 +189,10 @@ robot_conga/
 │   ├── ros_common.py             # WorldPoseSource (odom+TF / PoseStamped), cmd_vel publisher
 │   ├── leader_node.py            # records path, publishes /conga/path + /conga/leader_state
 │   ├── follower_node.py          # rotated Eq. 8 + watchdog + lidar e-stop
-│   ├── logger_node.py            # CSV logger for hardware / gz runs
+│   ├── logger_node.py            # CSV logger for hardware / sim runs
 │   └── launch_common.py          # node set shared by both launch files
 ├── launch/
-│   ├── conga_launch.py           # Gazebo (gz, turtlebot4_gz_bringup) + Conga nodes
+│   ├── conga_launch.py           # Ignition Gazebo (turtlebot4_ignition_bringup) + nodes
 │   └── conga_hardware_launch.py  # real robots only, no simulation
 ├── hardware/                     # phase0_bringup.sh (env + checks), fastdds.xml
 ├── scripts/analyze_log.py        # logger CSV -> same metrics and plots as the simulator
@@ -209,22 +209,22 @@ robot_conga/
 | Followers start at s < 0 and jump d ahead. | Startup prefix: a straight lead-in of (N−1)d behind the leader, so s = 0 is at the last robot and the leader starts at s = (N−1)d (`PrefixedPath`, `startup_prefix=True`, and in the leader node). |
 | A singularity freezes the follower permanently. | Last-resort `singularity_fallback`: u = 0, turn toward θ*, so the next cycle can use Eq. 8 again. |
 | Unbounded `nav_msgs/Path`; interpolating spline through noisy history; chord-sum s_L ≠ follower spline length. | The leader sends only a recent window (default (N−1)d + 2 m, hard cap 400 poses ≈ 32 KB), each pose carrying its arc length s in `position.z`. Followers fit smoothing splines x(s), y(s) (smoothing > 0) over the same points, so s_L and s_i share one parameterization. Leader state is a stamped `Vector3Stamped` (s_L, u_L, ω_L). |
-| Jazzy: TwistStamped, gz rename, mixed namespaces. | `cmd_vel_type` parameter (default TwistStamped); `turtlebot4_gz_bringup` (`sim.launch.py`, `turtlebot4_spawn.launch.py`); `tb4_i` namespaces everywhere. |
+| Launch file used non-existent `robot_spawn.launch.py`; mixed namespaces (`robot{i}` vs `tb4_i`). | Humble `turtlebot4_ignition_bringup` (`ignition.launch.py`, `turtlebot4_spawn.launch.py`); `tb4_i` namespaces everywhere; `cmd_vel_type` parameter (default `Twist` for Humble, `TwistStamped` available for Jazzy). |
 | No safety behaviour. | Follower watchdog (pose or leader state older than 0.2 s → zero velocity), lidar e-stop (< 0.3 m in a ±30° front sector, or no scan for 0.5 s → zero velocity), 0.25 m/s hard speed cap, and an optional `SafetyGate` in the simulator. |
 
-### Running on ROS 2 Jazzy
+### Running on ROS 2 Humble
 
 ```bash
 colcon build --symlink-install && source install/setup.bash
 
-# Gazebo (gz): world + 3 TurtleBot 4s + Conga nodes; drive tb4_0 with teleop
+# Ignition Gazebo (Fortress): world + 3 TurtleBot 4s + Conga nodes; drive tb4_0 with teleop
 ros2 launch robot_conga conga_launch.py num_robots:=3 delta_s:=1.0
 
 # Real robots: measure start poses (x, y, yaw in degrees) in your world frame
 ros2 launch robot_conga conga_hardware_launch.py num_robots:=3 delta_s:=1.0 \
-    start_poses:='0,0,0;-1,0,0;-2,0,0' cmd_vel_type:=TwistStamped pose_source:=odom
+    start_poses:='0,0,0;-1,0,0;-2,0,0' cmd_vel_type:=Twist pose_source:=odom
 ros2 run teleop_twist_keyboard teleop_twist_keyboard --ros-args \
-    -r cmd_vel:=/tb4_0/cmd_vel -p stamped:=true
+    -r cmd_vel:=/tb4_0/cmd_vel
 
 # Afterwards: metrics and plots from the logger CSV
 python scripts/analyze_log.py conga_log_<time>.csv --spacing 1.0 --out results/hardware
@@ -232,7 +232,7 @@ python scripts/analyze_log.py conga_log_<time>.csv --spacing 1.0 --out results/h
 
 Topics: `/conga/path` (nav_msgs/Path, transient-local), `/conga/leader_state` (Vector3Stamped: x = s_L, y = u_L, z = ω_L), `/tb4_i/conga/pose` and `/tb4_i/conga/reference` (PoseStamped in `world`, reference z = s_i), `/tb4_i/cmd_vel`. With `pose_source:=topic`, each node instead reads `/tb4_i/world_pose` (PoseStamped, e.g. from an overhead-camera tracker, in any frame with a TF to `world`).
 
-The nodes were smoke-tested on ROS 2 Humble (WSL) against simulated unicycle robots publishing fake odom and scan: followers start on the path, track the leader in the world frame, stop on the watchdog and the lidar e-stop, and the logger CSV feeds `analyze_log.py`. They have **not** yet run on real TurtleBot 4s or in gz.
+The nodes were smoke-tested on ROS 2 Humble (WSL, Ubuntu 22.04) against simulated unicycle robots publishing fake odom and scan: followers start on the path, track the leader in the world frame, stop on the watchdog and the lidar e-stop, and the logger CSV feeds `analyze_log.py`. They have **not** yet run on real TurtleBot 4s or in Ignition Gazebo.
 
 ---
 
@@ -337,7 +337,7 @@ Full circle, 3 robots (R = 1.5 m, v = 0.1 m/s, d = 1 m): position RMSE 1.7–2.1
 3. **The safety gate is simulator-only.** In ROS each follower only stops itself (watchdog / e-stop); the leader is driven by a person and does not wait for the line.
 4. **Odom drift.** With `pose_source:=odom`, the world frame is only as good as each robot's odometry plus the hand-measured start pose, and errors grow over a run. An external tracker (`pose_source:=topic`) removes this; an overhead-camera node is not included.
 5. **Watchdog vs Wi-Fi.** A 0.2 s timeout on odom (≈20 Hz) and on leader state over Wi-Fi can trigger on jitter and make followers stutter. If that happens, raise `watchdog_timeout`.
-6. **Unverified hardware assumptions:** the cmd_vel type (default TwistStamped), the RPLIDAR front at −90° in the scan frame (taken from the TB4 Jazzy URDF), and odom QoS (subscribed best-effort, which matches either publisher setting).
+6. **Unverified hardware assumptions:** the cmd_vel type (default Twist), the RPLIDAR front at −90° in the scan frame (taken from the TB4 Humble URDF), and odom QoS (subscribed best-effort, which matches either publisher setting).
 7. **Path transport shortcut:** the arc length s rides in `PoseStamped.position.z`, which avoids a custom message package. This only works for planar robots.
 
 ---

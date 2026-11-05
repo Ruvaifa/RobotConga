@@ -62,7 +62,7 @@ class FollowerNode(Node):
             "max_linear_velocity": MAX_SAFE_SPEED,
             "max_angular_velocity": 1.5,
             "singularity_threshold": 1e-3,
-            "cmd_vel_type": "TwistStamped",
+            "cmd_vel_type": "Twist",  # Humble TB4 / Create 3; TwistStamped on Jazzy
             "rate": 20.0,
             "watchdog_timeout": 0.2,
             "path_smoothing_std": 0.01,

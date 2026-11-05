@@ -1,4 +1,4 @@
-"""Launch helpers shared by the gz simulation and real-hardware launch files."""
+"""Launch helpers shared by the Ignition Gazebo simulation and real-hardware launch files."""
 
 import math
 from typing import List, Tuple
@@ -9,7 +9,7 @@ from launch_ros.actions import Node
 LAUNCH_ARGS = [
     DeclareLaunchArgument("num_robots", default_value="3", description="Robots in the line: tb4_0 (leader) .. tb4_{N-1}"),
     DeclareLaunchArgument("delta_s", default_value="1.0", description="Inter-robot spacing along the path (m)"),
-    DeclareLaunchArgument("cmd_vel_type", default_value="TwistStamped", choices=["Twist", "TwistStamped"],
+    DeclareLaunchArgument("cmd_vel_type", default_value="Twist", choices=["Twist", "TwistStamped"],
                           description="Check with: ros2 topic info -v /tb4_1/cmd_vel"),
     DeclareLaunchArgument("pose_source", default_value="odom", choices=["odom", "topic"],
                           description="odom + static world->tb4_i/odom TF, or a world-frame PoseStamped topic"),

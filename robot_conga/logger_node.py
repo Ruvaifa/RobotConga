@@ -31,7 +31,7 @@ class LoggerNode(Node):
         super().__init__("conga_logger")
         self.declare_parameter("num_robots", 3)
         self.declare_parameter("namespace_prefix", "tb4_")
-        self.declare_parameter("cmd_vel_type", "TwistStamped")
+        self.declare_parameter("cmd_vel_type", "Twist")
         self.declare_parameter("rate", 20.0)
         self.declare_parameter("output", "")  # default: conga_log_<unix time>.csv in cwd
         n = int(self.get_parameter("num_robots").value)

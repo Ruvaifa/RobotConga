@@ -1,5 +1,5 @@
 #!/bin/bash
-# Hardware bring-up and configuration for Robot Conga (TurtleBot 4 fleet, ROS 2 Jazzy)
+# Hardware bring-up and configuration for Robot Conga (TurtleBot 4 fleet, ROS 2 Humble)
 # Usage: ./phase0_bringup.sh [ROBOT_NAMESPACE]
 # Example:
 #   ./phase0_bringup.sh tb4_0   # Leader
@@ -40,7 +40,7 @@ echo "=========================================="
 echo "Validation checks:"
 echo "  1. View topics:   ros2 topic list | grep $ROBOT_NAMESPACE"
 echo "  2. Check odom Hz: ros2 topic hz /$ROBOT_NAMESPACE/odom"
-echo "  3. cmd_vel type:  ros2 topic info -v /$ROBOT_NAMESPACE/cmd_vel   (pass cmd_vel_type:=Twist|TwistStamped to the launch file)"
+echo "  3. cmd_vel type:  ros2 topic info -v /$ROBOT_NAMESPACE/cmd_vel   (expect geometry_msgs/msg/Twist on Humble)"
 echo "  4. Scan front:    ros2 topic echo /$ROBOT_NAMESPACE/scan --field ranges  (hand in front -> short ranges near index for -90 deg)"
-echo "  5. Teleop test:   ros2 run teleop_twist_keyboard teleop_twist_keyboard --ros-args -r cmd_vel:=/$ROBOT_NAMESPACE/cmd_vel -p stamped:=true"
+echo "  5. Teleop test:   ros2 run teleop_twist_keyboard teleop_twist_keyboard --ros-args -r cmd_vel:=/$ROBOT_NAMESPACE/cmd_vel"
 
